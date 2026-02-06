@@ -1,14 +1,14 @@
 [project]
-name = "comfyui-gguf"
-description = "GGUF Quantization support for native ComfyUI models."
+name = "comfyui-gguf-xpu"
+description = "GGUF Quantization support for native ComfyUI models with Intel XPU optimization."
 version = "2.0.0" # 2.0.0 = GitHub main, 1.X.X = ComfyUI Registry
 license = { file = "LICENSE" }
 dependencies = ["gguf>=0.13.0", "sentencepiece", "protobuf"]
 
 [project.urls]
-Repository = "https://github.com/city96/ComfyUI-GGUF"
+Repository = "https://github.com/analytics-zoo/ComfyUI-GGUF-XPU"
 
 [tool.comfy]
-PublisherId = "city96"
-DisplayName = "ComfyUI-GGUF"
+PublisherId = "analytics-zoo"
+DisplayName = "ComfyUI-GGUF-XPU"
 Icon = ""

@@ -163,6 +163,7 @@ class GGMLLayer(torch.nn.Module):
         if bias is not None:
             destination[prefix + "bias"] = self.get_weight(self.bias)
 
+    @torch.compiler.disable()
     def get_weight(self, tensor, dtype):
         if tensor is None:
             return
