@@ -1,29 +1,41 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
+import logging
+import os
+import platform
+from contextlib import nullcontext
+
 import gguf
 import torch
 from tqdm import tqdm
-import logging
-import os
 
 # ============================================================================
 # Environment Variable Configuration
 # ============================================================================
-# COMFYUI_GGUF_BACKEND: Force specific backend (esimd, triton, pytorch)
-#   - "esimd"   : Use Intel ESIMD kernels (requires Intel XPU + omni_xpu_kernel)
+# COMFYUI_GGUF_BACKEND: Select a managed or legacy backend.
+#   - "auto"    : Use Comfy Kitchen on XPU, otherwise preserve upstream routes
+#   - "kitchen" : Let Comfy Kitchen select its backend
+#   - "xpu"     : Force Comfy Kitchen's XPU backend
+#   - "eager"   : Force Comfy Kitchen's portable PyTorch backend
 #   - "triton"  : Use Triton kernels (requires triton package)
-#   - "pytorch" : Use pure PyTorch implementation (always available)
-#   - "auto"    : Auto-select best available (default)
+#   - "esimd" and "pytorch" remain compatibility aliases for "xpu" and "eager"
 #
 # COMFYUI_GGUF_DEBUG: Enable kernel selection debug logging (0/1)
 # ============================================================================
-BACKEND_ENV = os.environ.get("COMFYUI_GGUF_BACKEND", "auto").lower()
+_BACKEND_ALIASES = {"esimd": "xpu", "pytorch": "eager"}
+_VALID_BACKENDS = {"auto", "kitchen", "xpu", "eager", "triton"}
+BACKEND_ENV_RAW = os.environ.get("COMFYUI_GGUF_BACKEND", "auto").strip().lower()
+BACKEND_ENV = _BACKEND_ALIASES.get(BACKEND_ENV_RAW, BACKEND_ENV_RAW)
+if BACKEND_ENV not in _VALID_BACKENDS:
+    logging.warning(
+        "ComfyUI-GGUF: unknown COMFYUI_GGUF_BACKEND=%r; using auto",
+        BACKEND_ENV_RAW,
+    )
+    BACKEND_ENV = "auto"
 DEBUG_KERNEL_SELECTION = os.environ.get("COMFYUI_GGUF_DEBUG", "0") == "1"
 
 # ============================================================================
 # Triton Kernel Support
 # ============================================================================
-import platform
-
 if platform.system() == "Windows":
     HAS_TRITON = False
     logging.info("ComfyUI-GGUF: Triton not supported on Windows, using PyTorch fallback")
@@ -38,69 +50,70 @@ else:
         logging.info("ComfyUI-GGUF: Triton not available")
 
 # ============================================================================
-# Intel ESIMD Kernel Support (High Performance on Intel XPU)
-# Uses omni_xpu_kernel for optimized ESIMD kernels
+# Comfy Kitchen managed GGUF support
+#
+# ComfyUI-GGUF owns GGUF tensor semantics and logical shape. Comfy Kitchen owns
+# backend selection, native Omni dispatch, failure quarantine and eager fallback.
 # ============================================================================
-HAS_ESIMD = False
-omni_xpu_gguf = None
+comfy_kitchen = None
+_KITCHEN_IMPORT_ERROR = None
 try:
-    from omni_xpu_kernel import gguf as _omni_gguf
-    omni_xpu_gguf = _omni_gguf
-    HAS_ESIMD = True
-    logging.info("ComfyUI-GGUF: omni_xpu_kernel ESIMD available")
-except ImportError as e:
-    # Handle DLL loading errors on Windows gracefully
-    error_msg = str(e)
-    if platform.system() == "Windows" and "DLL load failed" in error_msg:
-        logging.warning(
-            f"ComfyUI-GGUF: omni_xpu_kernel DLL load failed on Windows. "
-            f"Make sure to run Intel oneAPI setvars.bat before starting ComfyUI. "
-            f"Error: {error_msg}"
-        )
-    else:
-        logging.info(f"ComfyUI-GGUF: omni_xpu_kernel not available ({type(e).__name__})")
-except Exception as e:
-    logging.info(f"ComfyUI-GGUF: omni_xpu_kernel not available ({type(e).__name__}: {e})")
+    import comfy_kitchen as _comfy_kitchen
+
+    comfy_kitchen = _comfy_kitchen
+    HAS_KITCHEN = all(
+        hasattr(comfy_kitchen, name)
+        for name in ("dequantize_gguf", "get_gguf_route_diagnostics", "use_backend")
+    )
+    if not HAS_KITCHEN:
+        _KITCHEN_IMPORT_ERROR = "installed package does not expose the GGUF API"
+except Exception as exc:
+    HAS_KITCHEN = False
+    _KITCHEN_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+
+if HAS_KITCHEN:
+    logging.info("ComfyUI-GGUF: Comfy Kitchen GGUF routing available")
+else:
+    logging.info("ComfyUI-GGUF: Comfy Kitchen GGUF routing unavailable (%s)", _KITCHEN_IMPORT_ERROR)
 
 # ============================================================================
 # Backend Selection Logic (based on environment variable)
 # ============================================================================
 USE_TORCH_COMPILE = False   # Disable torch.compile if using Triton
 
-if BACKEND_ENV == "esimd":
-    USE_ESIMD_KERNELS = True
+if BACKEND_ENV in {"kitchen", "xpu", "eager"}:
+    USE_KITCHEN_KERNELS = HAS_KITCHEN
     USE_TRITON_KERNELS = False
-    if not HAS_ESIMD:
-        logging.warning("ComfyUI-GGUF: ESIMD backend requested but omni_xpu_kernel not available!")
+    if not HAS_KITCHEN:
+        logging.warning(
+            "ComfyUI-GGUF: %s backend requested but Comfy Kitchen GGUF support is unavailable",
+            BACKEND_ENV_RAW,
+        )
 elif BACKEND_ENV == "triton":
-    USE_ESIMD_KERNELS = False
+    USE_KITCHEN_KERNELS = False
     USE_TRITON_KERNELS = True
     if not HAS_TRITON:
         logging.warning("ComfyUI-GGUF: Triton backend requested but triton not available!")
-elif BACKEND_ENV == "pytorch":
-    USE_ESIMD_KERNELS = False
-    USE_TRITON_KERNELS = False
-else:  # "auto" or any other value
-    USE_ESIMD_KERNELS = True
+else:
+    USE_KITCHEN_KERNELS = HAS_KITCHEN
     USE_TRITON_KERNELS = True
 
 # ============================================================================
 # Log Current Backend Selection
 # ============================================================================
 def _get_active_backend():
-    """Determine which backend will actually be used for each quant type"""
+    """Describe configured routing; completed calls are reported by Kitchen diagnostics."""
     backends = {}
-    
-    # Q4_0, Q8_0, Q4_K, Q6_K - ESIMD preferred on XPU
+
     for qtype in ["Q4_0", "Q8_0", "Q4_K", "Q6_K"]:
-        if HAS_ESIMD and USE_ESIMD_KERNELS:
-            backends[qtype] = "ESIMD"
+        if HAS_KITCHEN and USE_KITCHEN_KERNELS:
+            override = BACKEND_ENV if BACKEND_ENV in {"xpu", "eager"} else "managed XPU"
+            backends[qtype] = f"Kitchen ({override})"
         elif HAS_TRITON and USE_TRITON_KERNELS and qtype in ["Q4_0", "Q8_0", "Q4_1"]:
             backends[qtype] = "Triton"
         else:
             backends[qtype] = "PyTorch"
-    
-    # Q4_1 - only Triton or PyTorch
+
     if HAS_TRITON and USE_TRITON_KERNELS:
         backends["Q4_1"] = "Triton"
     else:
@@ -114,14 +127,14 @@ _active_backends = _get_active_backend()
 logging.info("=" * 60)
 logging.info("ComfyUI-GGUF Kernel Configuration")
 logging.info("=" * 60)
-logging.info(f"  Environment: COMFYUI_GGUF_BACKEND={BACKEND_ENV}")
-logging.info(f"  Available backends:")
-logging.info(f"    - ESIMD:   {'Yes' if HAS_ESIMD else 'No'} (enabled: {USE_ESIMD_KERNELS})")
-logging.info(f"    - Triton:  {'Yes' if HAS_TRITON else 'No'} (enabled: {USE_TRITON_KERNELS})")
-logging.info(f"    - PyTorch: Yes (fallback)")
-logging.info(f"  Active kernels (on XPU):")
+logging.info("  Environment: COMFYUI_GGUF_BACKEND=%s", BACKEND_ENV_RAW)
+logging.info("  Available backends:")
+logging.info("    - Kitchen: %s (enabled: %s)", "Yes" if HAS_KITCHEN else "No", USE_KITCHEN_KERNELS)
+logging.info("    - Triton:  %s (enabled: %s)", "Yes" if HAS_TRITON else "No", USE_TRITON_KERNELS)
+logging.info("    - PyTorch: Yes (fallback)")
+logging.info("  Configured routes:")
 for qtype, backend in _active_backends.items():
-    logging.info(f"    - {qtype}: {backend}")
+    logging.info("    - %s: %s", qtype, backend)
 logging.info("=" * 60)
 
 
@@ -138,7 +151,7 @@ def get_kernel_info():
     """
     info = {
         "backends": {
-            "ESIMD": {"available": HAS_ESIMD, "enabled": USE_ESIMD_KERNELS},
+            "Kitchen": {"available": HAS_KITCHEN, "enabled": USE_KITCHEN_KERNELS},
             "Triton": {"available": HAS_TRITON, "enabled": USE_TRITON_KERNELS},
             "PyTorch": {"available": True, "enabled": True},
         },
@@ -150,13 +163,15 @@ def get_kernel_info():
         "Q4_1_kernel": None,
     }
     
-    # Determine ESIMD kernels (XPU)
-    if HAS_ESIMD and USE_ESIMD_KERNELS:
-        info["Q4_0_kernel"] = "ESIMD"
-        info["Q8_0_kernel"] = "ESIMD"
-        info["Q4_K_kernel"] = "ESIMD"
-        info["Q6_K_kernel"] = "ESIMD"
-        info["selection_priority"].append("ESIMD (Q4_0, Q8_0, Q4_K, Q6_K on XPU)")
+    if HAS_KITCHEN and USE_KITCHEN_KERNELS:
+        route = f"Kitchen ({BACKEND_ENV if BACKEND_ENV != 'auto' else 'managed'})"
+        info["Q4_0_kernel"] = route
+        info["Q8_0_kernel"] = route
+        info["Q4_K_kernel"] = route
+        info["Q6_K_kernel"] = route
+        info["selection_priority"].append(
+            "Comfy Kitchen (Q4_0, Q8_0, Q4_K, Q6_K; managed XPU/eager routing)"
+        )
     elif HAS_TRITON and USE_TRITON_KERNELS:
         info["Q4_0_kernel"] = "Triton"
     else:
@@ -173,14 +188,17 @@ def get_kernel_info():
             info["Q8_0_kernel"] = "PyTorch"
         info["Q4_1_kernel"] = "PyTorch"
     
-    # PyTorch fallback for K-quants if no ESIMD
+    # PyTorch fallback for K-quants if Kitchen is unavailable or disabled
     if info["Q4_K_kernel"] is None:
         info["Q4_K_kernel"] = "PyTorch"
     if info["Q6_K_kernel"] is None:
         info["Q6_K_kernel"] = "PyTorch"
     
     info["selection_priority"].append("PyTorch (fallback)")
-    
+
+    if HAS_KITCHEN:
+        info["kitchen_diagnostics"] = comfy_kitchen.get_gguf_route_diagnostics()
+
     return info
 
 
@@ -450,67 +468,51 @@ def dequantize_tensor(tensor, dtype=None, dequant_dtype=None):
 
 
 # ============================================================================
-# ESIMD Dequantization Wrappers (for ComfyUI format)
+# Comfy Kitchen GGUF adapter
 # ============================================================================
-def _dequantize_q4_0_esimd(blocks, block_size, type_size, dtype=None):
-    """ESIMD Q4_0 dequantization for Intel XPU"""
-    n_blocks = blocks.shape[0]
-    flat_input = blocks.flatten().contiguous()
-    
-    # Use omni_xpu_kernel ESIMD kernel with ComfyUI format (sequential layout)
-    output = omni_xpu_gguf.dequantize_q4_0_comfyui(
-        flat_input, 
-        dtype if dtype is not None else torch.float16
+_KITCHEN_QTYPES = {
+    gguf.GGMLQuantizationType.Q4_0: "q4_0",
+    gguf.GGMLQuantizationType.Q8_0: "q8_0",
+    gguf.GGMLQuantizationType.Q4_K: "q4_k",
+    gguf.GGMLQuantizationType.Q6_K: "q6_k",
+}
+
+
+def _use_kitchen_for(qtype, device_type, dtype=None):
+    if not HAS_KITCHEN or not USE_KITCHEN_KERNELS or qtype not in _KITCHEN_QTYPES:
+        return False
+    if dtype not in (None, torch.float16, torch.bfloat16):
+        return False
+    if BACKEND_ENV == "auto":
+        return device_type == "xpu"
+    return BACKEND_ENV in {"kitchen", "xpu", "eager"}
+
+
+def _dequantize_kitchen(blocks, qtype, block_size, dtype=None):
+    """Dequantize a plugin-owned GGUF tensor through Comfy Kitchen."""
+    output_dtype = dtype if dtype is not None else torch.float16
+    backend_override = BACKEND_ENV if BACKEND_ENV in {"xpu", "eager"} else None
+    backend_context = (
+        comfy_kitchen.use_backend(backend_override)
+        if backend_override is not None
+        else nullcontext()
     )
-    
-    # Reshape to match expected output: [n_blocks, block_size]
-    return output.reshape(n_blocks, block_size)
+    with backend_context:
+        output = comfy_kitchen.dequantize_gguf(
+            blocks.reshape(-1).contiguous(),
+            _KITCHEN_QTYPES[qtype],
+            output_dtype=output_dtype,
+            layout="comfyui",
+        )
+    return output.reshape(blocks.shape[0], block_size)
 
-
-def _dequantize_q8_0_esimd(blocks, block_size, type_size, dtype=None):
-    """ESIMD Q8_0 dequantization for Intel XPU"""
-    n_blocks = blocks.shape[0]
-    flat_input = blocks.flatten().contiguous()
-    
-    output = omni_xpu_gguf.dequantize_q8_0(
-        flat_input, 
-        dtype if dtype is not None else torch.float16
-    )
-    
-    return output.reshape(n_blocks, block_size)
-
-
-def _dequantize_q4_k_esimd(blocks, block_size, type_size, dtype=None):
-    """ESIMD Q4_K dequantization for Intel XPU"""
-    n_blocks = blocks.shape[0]
-    flat_input = blocks.flatten().contiguous()
-    
-    output = omni_xpu_gguf.dequantize_q4_k(
-        flat_input, 
-        dtype if dtype is not None else torch.float16
-    )
-    
-    return output.reshape(n_blocks, block_size)
-
-
-def _dequantize_q6_k_esimd(blocks, block_size, type_size, dtype=None):
-    """ESIMD Q6_K dequantization for Intel XPU"""
-    n_blocks = blocks.shape[0]
-    flat_input = blocks.flatten().contiguous()
-    
-    output = omni_xpu_gguf.dequantize_q6_k(
-        flat_input, 
-        dtype if dtype is not None else torch.float16
-    )
-    
-    return output.reshape(n_blocks, block_size)
 
 def dequantize(data, qtype, oshape, dtype=None):
     """
     Dequantize tensor back to usable shape/dtype
     
     Kernel selection priority:
-    1. ESIMD (Intel XPU: Q4_0, Q8_0, Q4_K, Q6_K)
+    1. Comfy Kitchen (Intel XPU: Q4_0, Q8_0, Q4_K, Q6_K)
     2. Triton (XPU/CUDA: Q4_0, Q8_0, Q4_1)
     3. PyTorch (fallback)
     """
@@ -526,28 +528,15 @@ def dequantize(data, qtype, oshape, dtype=None):
     # Select dequantization implementation
     device_type = data.device.type
     
-    # Try ESIMD kernels first (best performance on Intel XPU)
-    if HAS_ESIMD and USE_ESIMD_KERNELS and device_type == 'xpu':
-        if qtype == gguf.GGMLQuantizationType.Q4_0:
-            if DEBUG_KERNEL_SELECTION:
-                logging.info(f"ComfyUI-GGUF: Using ESIMD kernel for Q4_0 ({n_blocks} blocks)")
-            result = _dequantize_q4_0_esimd(blocks, block_size, type_size, dtype)
-            return result.reshape(oshape)
-        elif qtype == gguf.GGMLQuantizationType.Q8_0:
-            if DEBUG_KERNEL_SELECTION:
-                logging.info(f"ComfyUI-GGUF: Using ESIMD kernel for Q8_0 ({n_blocks} blocks)")
-            result = _dequantize_q8_0_esimd(blocks, block_size, type_size, dtype)
-            return result.reshape(oshape)
-        elif qtype == gguf.GGMLQuantizationType.Q4_K:
-            if DEBUG_KERNEL_SELECTION:
-                logging.info(f"ComfyUI-GGUF: Using ESIMD kernel for Q4_K ({n_blocks} blocks)")
-            result = _dequantize_q4_k_esimd(blocks, block_size, type_size, dtype)
-            return result.reshape(oshape)
-        elif qtype == gguf.GGMLQuantizationType.Q6_K:
-            if DEBUG_KERNEL_SELECTION:
-                logging.info(f"ComfyUI-GGUF: Using ESIMD kernel for Q6_K ({n_blocks} blocks)")
-            result = _dequantize_q6_k_esimd(blocks, block_size, type_size, dtype)
-            return result.reshape(oshape)
+    if _use_kitchen_for(qtype, device_type, dtype):
+        if DEBUG_KERNEL_SELECTION:
+            logging.info(
+                "ComfyUI-GGUF: Using Comfy Kitchen for %s (%d blocks)",
+                qtype.name,
+                n_blocks,
+            )
+        result = _dequantize_kitchen(blocks, qtype, block_size, dtype)
+        return result.reshape(oshape)
     
     # Try Triton kernels next (best performance)
     if HAS_TRITON and USE_TRITON_KERNELS and device_type in ('xpu', 'cuda'):

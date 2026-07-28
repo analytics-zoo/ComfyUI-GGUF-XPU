@@ -3,118 +3,88 @@ GGUF Quantization support for native ComfyUI models
 
 ---
 
-## 🚀 Intel XPU Optimization (New!)
+## Intel XPU optimization
 
-This fork includes **high-performance dequantization kernels optimized for Intel XPU**. The optimizations provide significant speedups compared to the original PyTorch implementation.
+This fork integrates Intel XPU GGUF dequantization through
+[Comfy Kitchen XPU](https://github.com/xiangyuT/comfy-kitchen-xpu). The custom
+node owns GGUF tensor loading and logical shapes; Comfy Kitchen owns backend
+selection, native-kernel dispatch, failure quarantine, and portable eager
+fallback. The node no longer imports Omni XPU Kernel directly.
 
-> **Acknowledgement**: This project is based on [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF). We sincerely thank the original author for their excellent work.
+> **Acknowledgement**: This project is based on
+> [city96/ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF). We thank City96
+> and upstream contributors for the GGUF loader and reference dequantization
+> implementation.
 
-> **Part of LLM-Scaler**: This optimized fork is developed as part of [Intel LLM-Scaler](https://github.com/intel/llm-scaler.git) project. For a complete out-of-the-box Docker image solution with all dependencies pre-configured, please refer to **LLM-Scaler Omni** image.
+The integrated environment is delivered through
+[Intel LLM-Scaler](https://github.com/intel/llm-scaler). LLM-Scaler pins
+compatible Comfy Kitchen and Omni XPU Kernel revisions in its Omni image.
 
 ### Supported Quantization Formats
 
-| Format | ESIMD (XPU) | Triton | PyTorch (from city96/ComfyUI-GGUF) |
-|--------|-------------|-------------------|-------------------|
-| Q4_0 | ✅ | ✅ | ✅ |
-| Q8_0 | ✅ | ✅ | ✅ |
-| Q4_K | ✅ | ❌ | ✅ |
-| Q6_K | ✅ | ❌ | ✅ |
-| Q4_1 | ❌ | ✅ | ✅ |
-| Q5_0/Q5_1 | ❌ | ❌ | ✅ |
-| Q3_K/Q5_K | ❌ | ❌ | ✅ |
+| Format | Comfy Kitchen XPU/eager | Legacy Triton | Plugin PyTorch |
+|--------|-------------------------|---------------|----------------|
+| Q4_0 | Yes | Yes | Yes |
+| Q8_0 | Yes | Yes | Yes |
+| Q4_K | Yes | No | Yes |
+| Q6_K | Yes | No | Yes |
+| Q4_1 | No | Yes | Yes |
+| Other upstream formats | No | No | Yes |
 
-### Gallery
+Q4_0, Q8_0, Q4_K, and Q6_K use the managed Kitchen route on Intel XPU.
+Q4_1 remains on the existing plugin Triton/PyTorch path. Other formats keep the
+upstream PyTorch or NumPy fallback.
 
-<!-- Add generated samples here -->
-
-*Coming soon...*
-
-### Verified Environment
-
-| Component | Version |
-|-----------|---------|
-| PyTorch | 2.9.0+xpu |
-| Triton | 3.5.0 |
-| pytorch-triton-xpu | 3.5.0 |
-| Intel oneAPI | 2025.1.3 |
-
-### Dependencies for Intel XPU
+### XPU dependencies
 
 ```bash
-# PyTorch with XPU support
-pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/xpu
+# Install the custom-node dependencies.
+python -m pip install -r requirements.txt
 
-# Required for ESIMD kernels: omni_xpu_kernel (from LLM-Scaler)
-git clone https://github.com/intel/llm-scaler.git
-cd llm-scaler/omni/omni_xpu_kernel
-pip install . --no-build-isolation
-
-# Optional: Triton for Intel XPU
-pip install triton==3.5.0
-pip install pytorch-triton-xpu==3.5.0 --index-url https://download.pytorch.org/whl/xpu
+# Install compatible Comfy Kitchen and Omni XPU Kernel builds supplied by the
+# target LLM-Scaler Omni image or by the corresponding source checkouts.
 ```
 
-### Backend Selection
+The node still loads without Comfy Kitchen and preserves its PyTorch/Triton
+fallbacks. The optimized XPU route requires a Comfy Kitchen build that exposes
+`dequantize_gguf`.
 
-The kernel backend is automatically selected based on availability. You can also force a specific backend using environment variables:
+### Backend selection
+
+The default is `auto`: supported GGUF formats use Comfy Kitchen on XPU, while
+other devices preserve the existing plugin paths.
 
 ```bash
-# Auto-select best available (default)
+# Managed XPU selection (default)
 export COMFYUI_GGUF_BACKEND=auto
 
-# Force ESIMD kernels (best performance on Intel XPU)
-export COMFYUI_GGUF_BACKEND=esimd
+# Let Kitchen choose, or force a Kitchen backend
+export COMFYUI_GGUF_BACKEND=kitchen
+export COMFYUI_GGUF_BACKEND=xpu
+export COMFYUI_GGUF_BACKEND=eager
 
-# Force Triton kernels
+# Keep the existing plugin Triton route
 export COMFYUI_GGUF_BACKEND=triton
 
-# Force PyTorch fallback
-export COMFYUI_GGUF_BACKEND=pytorch
-
-# Enable debug logging for kernel selection
+# Log configured routing
 export COMFYUI_GGUF_DEBUG=1
 ```
 
-### Running on Intel XPU
+`esimd` and `pytorch` are retained as compatibility aliases for `xpu` and
+`eager`. Startup logs describe configured routing. For routes that actually
+completed, inspect Kitchen diagnostics:
 
-1. **Set up Intel oneAPI environment** (required for ESIMD kernels):
-   ```bash
-   source /opt/intel/oneapi/setvars.sh
-   ```
+```python
+from comfy_kitchen import get_gguf_route_diagnostics
 
-2. **Start ComfyUI normally** - the optimized kernels will be used automatically when running on Intel XPU.
-
-3. **Verify kernel selection** by checking the logs:
-   ```
-   ComfyUI-GGUF Kernel Configuration
-   ============================================================
-     Environment: COMFYUI_GGUF_BACKEND=auto
-     Available backends:
-       - ESIMD:   Yes (enabled: True)
-       - Triton:  Yes (enabled: True)
-       - PyTorch: Yes (fallback)
-     Active kernels (on XPU):
-       - Q4_0: ESIMD
-       - Q8_0: ESIMD
-       - Q4_K: ESIMD
-       - Q6_K: ESIMD
-       - Q4_1: Triton
-   ============================================================
-   ```
-
-### Testing the Installation
-
-Run the integration test to verify everything is working:
-
-```bash
-cd ComfyUI/custom_nodes/ComfyUI-GGUF
-python test_omni_integration.py
+print(get_gguf_route_diagnostics())
 ```
 
-Or run the benchmark to measure performance:
+### Integration test
 
 ```bash
-python bench_comfyui.py
+PYTHONPATH=/path/to/comfy-kitchen-xpu \
+  python -m pytest -q tests/test_kitchen_gguf.py
 ```
 
 ---
