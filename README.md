@@ -25,15 +25,14 @@ compatible Comfy Kitchen and Omni XPU Kernel revisions in its Omni image.
 | Format | Comfy Kitchen XPU/eager | Legacy Triton | Plugin PyTorch |
 |--------|-------------------------|---------------|----------------|
 | Q4_0 | Yes | Yes | Yes |
+| Q4_1 | Yes | Yes | Yes |
 | Q8_0 | Yes | Yes | Yes |
 | Q4_K | Yes | No | Yes |
 | Q6_K | Yes | No | Yes |
-| Q4_1 | No | Yes | Yes |
 | Other upstream formats | No | No | Yes |
 
-Q4_0, Q8_0, Q4_K, and Q6_K use the managed Kitchen route on Intel XPU.
-Q4_1 remains on the existing plugin Triton/PyTorch path. Other formats keep the
-upstream PyTorch or NumPy fallback.
+Q4_0, Q4_1, Q8_0, Q4_K, and Q6_K use the managed Kitchen route on Intel XPU.
+Other formats keep the upstream PyTorch or NumPy fallback.
 
 ### XPU dependencies
 

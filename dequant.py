@@ -82,6 +82,15 @@ if HAS_KITCHEN:
 else:
     logging.info("ComfyUI-GGUF: Comfy Kitchen GGUF routing unavailable (%s)", _KITCHEN_IMPORT_ERROR)
 
+_KITCHEN_QUANT_NAMES = frozenset()
+if HAS_KITCHEN:
+    try:
+        from comfy_kitchen.gguf import GGUF_QUANT_TYPE_TO_CODE as _KITCHEN_QUANT_CODES
+
+        _KITCHEN_QUANT_NAMES = frozenset(_KITCHEN_QUANT_CODES)
+    except (ImportError, AttributeError):
+        _KITCHEN_QUANT_NAMES = frozenset({"q4_0", "q8_0", "q4_k", "q6_k"})
+
 # ============================================================================
 # Backend Selection Logic (based on environment variable)
 # ============================================================================
@@ -111,19 +120,16 @@ def _get_active_backend():
     """Describe configured routing; completed calls are reported by Kitchen diagnostics."""
     backends = {}
 
-    for qtype in ["Q4_0", "Q8_0", "Q4_K", "Q6_K"]:
-        if HAS_KITCHEN and USE_KITCHEN_KERNELS:
+    for qtype in ["Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q6_K"]:
+        kitchen_name = qtype.lower()
+        kitchen_supported = kitchen_name in _KITCHEN_QUANT_NAMES
+        if HAS_KITCHEN and USE_KITCHEN_KERNELS and kitchen_supported:
             override = BACKEND_ENV if BACKEND_ENV in {"xpu", "eager"} else "managed XPU"
             backends[qtype] = f"Kitchen ({override})"
         elif HAS_TRITON and USE_TRITON_KERNELS and qtype in ["Q4_0", "Q8_0", "Q4_1"]:
             backends[qtype] = "Triton"
         else:
             backends[qtype] = "PyTorch"
-
-    if HAS_TRITON and USE_TRITON_KERNELS:
-        backends["Q4_1"] = "Triton"
-    else:
-        backends["Q4_1"] = "PyTorch"
     
     return backends
 
@@ -171,12 +177,11 @@ def get_kernel_info():
     
     if HAS_KITCHEN and USE_KITCHEN_KERNELS:
         route = f"Kitchen ({BACKEND_ENV if BACKEND_ENV != 'auto' else 'managed'})"
-        info["Q4_0_kernel"] = route
-        info["Q8_0_kernel"] = route
-        info["Q4_K_kernel"] = route
-        info["Q6_K_kernel"] = route
+        for qtype in ("Q4_0", "Q4_1", "Q8_0", "Q4_K", "Q6_K"):
+            if qtype.lower() in _KITCHEN_QUANT_NAMES:
+                info[f"{qtype}_kernel"] = route
         info["selection_priority"].append(
-            "Comfy Kitchen (Q4_0, Q8_0, Q4_K, Q6_K; managed XPU/eager routing)"
+            "Comfy Kitchen (supported GGUF formats; managed XPU/eager routing)"
         )
     elif HAS_TRITON and USE_TRITON_KERNELS:
         info["Q4_0_kernel"] = "Triton"
@@ -187,7 +192,8 @@ def get_kernel_info():
     if HAS_TRITON and USE_TRITON_KERNELS:
         if info["Q8_0_kernel"] is None:
             info["Q8_0_kernel"] = "Triton"
-        info["Q4_1_kernel"] = "Triton"
+        if info["Q4_1_kernel"] is None:
+            info["Q4_1_kernel"] = "Triton"
         info["selection_priority"].append("Triton (Q8_0, Q4_1 on XPU/CUDA)")
     else:
         if info["Q8_0_kernel"] is None:
@@ -483,6 +489,9 @@ _KITCHEN_QTYPES = {
     gguf.GGMLQuantizationType.Q6_K: "q6_k",
 }
 
+if "q4_1" in _KITCHEN_QUANT_NAMES:
+    _KITCHEN_QTYPES[gguf.GGMLQuantizationType.Q4_1] = "q4_1"
+
 
 def _use_kitchen_for(qtype, device_type, dtype=None):
     if not HAS_KITCHEN or not USE_KITCHEN_KERNELS or qtype not in _KITCHEN_QTYPES:
@@ -518,7 +527,7 @@ def dequantize(data, qtype, oshape, dtype=None):
     Dequantize tensor back to usable shape/dtype
     
     Kernel selection priority:
-    1. Comfy Kitchen (Intel XPU: Q4_0, Q8_0, Q4_K, Q6_K)
+    1. Comfy Kitchen (Intel XPU: Q4_0, Q4_1, Q8_0, Q4_K, Q6_K)
     2. Triton (XPU/CUDA: Q4_0, Q8_0, Q4_1)
     3. PyTorch (fallback)
     """

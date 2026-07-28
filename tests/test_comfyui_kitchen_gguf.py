@@ -16,6 +16,7 @@ pytestmark = pytest.mark.skipif(
 
 CASES = (
     (gguf.GGMLQuantizationType.Q4_0, "q4_0", 18, 32),
+    (gguf.GGMLQuantizationType.Q4_1, "q4_1", 20, 32),
     (gguf.GGMLQuantizationType.Q8_0, "q8_0", 34, 32),
     (gguf.GGMLQuantizationType.Q4_K, "q4_k", 144, 256),
     (gguf.GGMLQuantizationType.Q6_K, "q6_k", 210, 256),
@@ -59,6 +60,9 @@ def _packed_blocks(block_bytes, *, count=4):
     )
     if block_bytes in (18, 34):
         blocks[:, :2] = _fp16_bytes(0.5)
+    elif block_bytes == 20:
+        blocks[:, :2] = _fp16_bytes(0.5)
+        blocks[:, 2:4] = _fp16_bytes(0.25)
     elif block_bytes == 144:
         blocks[:, :2] = _fp16_bytes(0.5)
         blocks[:, 2:4] = _fp16_bytes(0.25)

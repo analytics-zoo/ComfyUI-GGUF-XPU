@@ -14,6 +14,7 @@ import dequant
 
 CASES = (
     (gguf.GGMLQuantizationType.Q4_0, "q4_0", 18, 32),
+    (gguf.GGMLQuantizationType.Q4_1, "q4_1", 20, 32),
     (gguf.GGMLQuantizationType.Q8_0, "q8_0", 34, 32),
     (gguf.GGMLQuantizationType.Q4_K, "q4_k", 144, 256),
     (gguf.GGMLQuantizationType.Q6_K, "q6_k", 210, 256),
@@ -131,27 +132,6 @@ def test_plugin_kitchen_eager_matches_existing_reference(
     assert torch.equal(actual, expected)
     assert dequant.comfy_kitchen.get_gguf_route_diagnostics()["routes"] == {"eager": 1}
     assert dequant._KITCHEN_QTYPES[qtype] == quant_name
-
-
-def test_q4_1_keeps_plugin_fallback(kitchen_route):
-    qtype = gguf.GGMLQuantizationType.Q4_1
-    block_size, block_bytes = gguf.GGML_QUANT_SIZES[qtype]
-    blocks = _packed_blocks(block_bytes)
-    expected = dequant.dequantize_functions[qtype](
-        blocks,
-        block_size,
-        block_bytes,
-        torch.float16,
-    ).reshape(-1)
-
-    actual = dequant.dequantize(
-        blocks,
-        qtype,
-        (blocks.shape[0] * block_size,),
-        dtype=torch.float16,
-    )
-
-    assert torch.equal(actual, expected)
 
 
 def test_unsupported_kitchen_output_dtype_keeps_plugin_fallback(kitchen_route, monkeypatch):
