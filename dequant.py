@@ -25,6 +25,12 @@ _BACKEND_ALIASES = {"esimd": "xpu", "pytorch": "eager"}
 _VALID_BACKENDS = {"auto", "kitchen", "xpu", "eager", "triton"}
 BACKEND_ENV_RAW = os.environ.get("COMFYUI_GGUF_BACKEND", "auto").strip().lower()
 BACKEND_ENV = _BACKEND_ALIASES.get(BACKEND_ENV_RAW, BACKEND_ENV_RAW)
+if BACKEND_ENV_RAW in _BACKEND_ALIASES:
+    logging.warning(
+        "ComfyUI-GGUF: COMFYUI_GGUF_BACKEND=%s is deprecated; use %s",
+        BACKEND_ENV_RAW,
+        BACKEND_ENV,
+    )
 if BACKEND_ENV not in _VALID_BACKENDS:
     logging.warning(
         "ComfyUI-GGUF: unknown COMFYUI_GGUF_BACKEND=%r; using auto",
